@@ -84,17 +84,13 @@ python -m venv venv
 
 ### 2️⃣ Activate
 
-## For Windows
 ```
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
 ```
 .\venv\Scripts\activate
 ```
-## For Linux
-```
-source venv/bin/activate
-```
+
 
 ### 3️⃣ Install Requirements
 
