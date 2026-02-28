@@ -90,7 +90,7 @@ python -m venv venv
 ```
 ## For Linux
 ```
-./venv/bin/activate
+source venv/bin/activate
 ```
 
 ### 3️⃣ Install Requirements
