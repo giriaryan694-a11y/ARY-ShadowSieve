@@ -84,9 +84,14 @@ python -m venv venv
 
 ### 2️⃣ Activate
 
+## For Windows
 ```
-venv\Scripts\activate
+.\venv\Scripts\activate
 ```
+## For Linux
+'''
+./venv/bin/activate
+'''
 
 ### 3️⃣ Install Requirements
 
