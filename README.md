@@ -86,6 +86,9 @@ python -m venv venv
 
 ## For Windows
 ```
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+```
 .\venv\Scripts\activate
 ```
 ## For Linux
