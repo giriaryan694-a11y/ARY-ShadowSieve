@@ -88,9 +88,14 @@ def add_web_log(ip, action="logged into dashboard"):
     if len(web_logs) > MAX_LOGS: web_logs.pop()
     with open(LOG_FILE, 'a') as f: f.write(log_entry + '\n')
 
-def add_proxy_log(ip, target, status="->"):
+def add_proxy_log(ip, target, resolved_ip, status="requested"):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = f"[{timestamp}] {ip} {status} {target}"
+    # Updated precise logging format
+    if status == "requested":
+        log_entry = f"[{timestamp}] Client {ip} → requested {target} Resolved to → {resolved_ip}"
+    else:
+        log_entry = f"[{timestamp}] Client {ip} → {status} {target} Resolved to → {resolved_ip}"
+        
     proxy_logs.insert(0, log_entry)
     if len(proxy_logs) > MAX_LOGS: proxy_logs.pop()
     with open(LOG_FILE, 'a') as f: f.write(log_entry + '\n')
@@ -195,23 +200,41 @@ def handle_client(client_socket):
         if cmd != 1: return
             
         domain = ""
-        # Handle Domain logging (Requires client to pass Hostname, not just IP)
-        if address_type == 1: domain = socket.inet_ntoa(client_socket.recv(4))
-        elif address_type == 3: domain = client_socket.recv(client_socket.recv(1)[0]).decode()
-        elif address_type == 4: domain = socket.inet_ntop(socket.AF_INET6, client_socket.recv(16))
+        resolved_ip = ""
+        
+        # Handle Domain logging and DNS Resolution
+        if address_type == 1: 
+            domain = socket.inet_ntoa(client_socket.recv(4))
+            resolved_ip = domain
+        elif address_type == 3: 
+            domain_length = client_socket.recv(1)[0]
+            domain = client_socket.recv(domain_length).decode()
+            try:
+                # Resolve the domain to an IP address dynamically
+                resolved_ip = socket.gethostbyname(domain)
+            except Exception:
+                try:
+                    # Fallback for IPv6 networks
+                    resolved_ip = socket.getaddrinfo(domain, None)[0][4][0]
+                except Exception:
+                    resolved_ip = "Unresolved"
+        elif address_type == 4: 
+            domain = socket.inet_ntop(socket.AF_INET6, client_socket.recv(16))
+            resolved_ip = domain
+            
         port = struct.unpack("!H", client_socket.recv(2))[0]
 
         if config['use_target_allow'] and config['target_allow']:
             if not is_match(domain, config['target_allow']):
-                add_proxy_log(client_ip, domain, "[BLOCKED BY ALLOWLIST] ->")
+                add_proxy_log(client_ip, domain, resolved_ip, "BLOCKED BY ALLOWLIST")
                 client_socket.sendall(struct.pack("!BBBBIH", 5, 2, 0, 1, 0, 0)); return
                 
         if config['use_target_block'] and config['target_block']:
             if is_match(domain, config['target_block']):
-                add_proxy_log(client_ip, domain, "[BLOCKED] ->")
+                add_proxy_log(client_ip, domain, resolved_ip, "BLOCKED")
                 client_socket.sendall(struct.pack("!BBBBIH", 5, 2, 0, 1, 0, 0)); return
 
-        add_proxy_log(client_ip, domain, "->")
+        add_proxy_log(client_ip, domain, resolved_ip, "requested")
         remote = socket.create_connection((domain, port), timeout=15.0)
         client_socket.sendall(struct.pack("!BBBBIH", 5, 0, 0, 1, 0, 0))
 
