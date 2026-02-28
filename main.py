@@ -10,6 +10,8 @@ import ssl
 import logging
 import traceback
 import re
+import queue
+import time
 from flask import Flask, request, render_template_string, redirect, session, jsonify, Response
 import pyfiglet
 from colorama import init, Fore, Style
@@ -30,6 +32,7 @@ KEY_FILE = 'key.pem'
 CERT_CRT_FILE = 'cert.crt'
 SETTINGS_FILE = 'settings.txt'
 
+# List Files
 FILE_PROXY_CLIENT_ALLOW = 'proxy_clients_allow.txt'
 FILE_PROXY_CLIENT_BLOCK = 'proxy_clients_block.txt'
 FILE_TARGET_ALLOW = 'targets_allow.txt'
@@ -39,9 +42,11 @@ FILE_WEB_CLIENT_BLOCK = 'web_clients_block.txt'
 
 config = {
     'web_user': '', 'web_pass': '', 'proxy_user': '', 'proxy_pass': '',
+    
     'proxy_client_allow': [], 'proxy_client_block': [],
     'target_allow': [], 'target_block': [],
     'web_client_allow': [], 'web_client_block': [],
+    
     'use_proxy_client_allow': False,
     'use_target_allow': False,
     'use_target_block': True,
@@ -54,6 +59,45 @@ MAX_LOGS = 150
 seen_ips = set()
 active_clients = {}
 clients_lock = threading.Lock()
+
+# --- Performance Enhancements (DNS Cache & Async Logging) ---
+dns_cache = {}
+dns_cache_ttl = 300
+dns_lock = threading.Lock()
+log_queue = queue.Queue()
+
+def log_writer():
+    while True:
+        try:
+            entry = log_queue.get()
+            with open(LOG_FILE, 'a') as f:
+                f.write(entry + '\n')
+            log_queue.task_done()
+        except:
+            pass
+
+threading.Thread(target=log_writer, daemon=True).start()
+
+def resolve_domain(domain):
+    now = time.time()
+    with dns_lock:
+        if domain in dns_cache:
+            ip, expiry = dns_cache[domain]
+            if now < expiry:
+                return ip
+
+    try:
+        ip = socket.gethostbyname(domain)
+    except:
+        try:
+            ip = socket.getaddrinfo(domain, None)[0][4][0]
+        except:
+            return "Unresolved"
+
+    with dns_lock:
+        dns_cache[domain] = (ip, now + dns_cache_ttl)
+
+    return ip
 
 # --- Security & TLS Setup ---
 def generate_tls_cert():
@@ -81,7 +125,6 @@ def generate_tls_cert():
 # --- Deep Packet Inspection Extractors ---
 def extract_sni(data):
     try:
-        # Check if it's a TLS handshake (0x16)
         if len(data) < 44 or data[0] != 0x16: return None
         session_id_length = data[43]
         idx = 44 + session_id_length
@@ -99,13 +142,13 @@ def extract_sni(data):
             ext_type = struct.unpack(">H", data[idx:idx+2])[0]
             ext_size = struct.unpack(">H", data[idx+2:idx+4])[0]
             idx += 4
-            if ext_type == 0:  # Type 0 is SNI
+            if ext_type == 0:
                 if idx + 5 <= len(data):
                     sni_len = struct.unpack(">H", data[idx+3:idx+5])[0]
                     if idx + 5 + sni_len <= len(data):
                         return data[idx+5:idx+5+sni_len].decode('utf-8', errors='ignore')
             idx += ext_size
-    except Exception:
+    except:
         return None
     return None
 
@@ -115,7 +158,7 @@ def extract_http_host(data):
             match = re.search(b'\\r\\nHost: (.*?)\\r\\n', data, re.IGNORECASE)
             if match:
                 return match.group(1).decode('utf-8', errors='ignore').split(':')[0]
-    except Exception:
+    except:
         return None
     return None
 
@@ -125,11 +168,10 @@ def add_web_log(ip, action="logged into dashboard"):
     log_entry = f"[{timestamp}] IP: {ip} {action}"
     web_logs.insert(0, log_entry)
     if len(web_logs) > MAX_LOGS: web_logs.pop()
-    with open(LOG_FILE, 'a') as f: f.write(log_entry + '\n')
+    log_queue.put(log_entry)
 
 def add_proxy_log(ip, target, resolved_ip, status="requested"):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
     if status == "requested":
         log_entry = f"[{timestamp}] Client {ip} → requested {target} Resolved to → {resolved_ip}"
     else:
@@ -137,7 +179,7 @@ def add_proxy_log(ip, target, resolved_ip, status="requested"):
         
     proxy_logs.insert(0, log_entry)
     if len(proxy_logs) > MAX_LOGS: proxy_logs.pop()
-    with open(LOG_FILE, 'a') as f: f.write(log_entry + '\n')
+    log_queue.put(log_entry)
 
 def load_config():
     if not os.path.exists(AUTH_FILE):
@@ -241,27 +283,20 @@ def handle_client(client_socket):
         domain = ""
         resolved_ip = ""
         
-        # Parse connection request
         if address_type == 1: 
             domain = socket.inet_ntoa(client_socket.recv(4))
             resolved_ip = domain
         elif address_type == 3: 
             domain_length = client_socket.recv(1)[0]
             domain = client_socket.recv(domain_length).decode()
-            try:
-                resolved_ip = socket.gethostbyname(domain)
-            except Exception:
-                try:
-                    resolved_ip = socket.getaddrinfo(domain, None)[0][4][0]
-                except Exception:
-                    resolved_ip = "Unresolved"
+            resolved_ip = resolve_domain(domain)
         elif address_type == 4: 
             domain = socket.inet_ntop(socket.AF_INET6, client_socket.recv(16))
             resolved_ip = domain
             
         port = struct.unpack("!H", client_socket.recv(2))[0]
 
-        # Stage 1 Checks (SOCKS5 Initial Handshake)
+        # Stage 1 Checks
         if config['use_target_allow'] and config['target_allow']:
             if not is_match(domain, config['target_allow']):
                 add_proxy_log(client_ip, domain, resolved_ip, "BLOCKED BY ALLOWLIST")
@@ -272,20 +307,25 @@ def handle_client(client_socket):
                 add_proxy_log(client_ip, domain, resolved_ip, "BLOCKED")
                 client_socket.sendall(struct.pack("!BBBBIH", 5, 2, 0, 1, 0, 0)); return
 
-        # Connect to destination and inform client
         remote = socket.create_connection((domain, port), timeout=15.0)
         client_socket.sendall(struct.pack("!BBBBIH", 5, 0, 0, 1, 0, 0))
 
-        # --- Deep Packet Inspection (DPI) ---
-        first_packet = client_socket.recv(4096)
-        if not first_packet:
-            return
+        # --- Opportunistic Non-Blocking Deep Packet Inspection ---
+        first_packet = None
+        try:
+            client_socket.setblocking(False)
+            first_packet = client_socket.recv(16384)
+            client_socket.setblocking(True)
+        except Exception:
+            client_socket.setblocking(True)
 
-        # Attempt to extract hidden domain from TLS or HTTP Headers
-        detected_domain = extract_sni(first_packet) or extract_http_host(first_packet)
+        detected_domain = None
+        if first_packet:
+            detected_domain = extract_sni(first_packet) or extract_http_host(first_packet)
+
         actual_target = detected_domain if detected_domain else domain
 
-        # Stage 2 Checks (DPI) - If we found a hidden domain, re-verify blocklists!
+        # Stage 2 Checks (DPI verification)
         if detected_domain and detected_domain != domain:
             if config['use_target_allow'] and config['target_allow']:
                 if not is_match(detected_domain, config['target_allow']):
@@ -297,17 +337,18 @@ def handle_client(client_socket):
                     add_proxy_log(client_ip, actual_target, resolved_ip, "BLOCKED (DPI)")
                     return
 
-        # Log connection with the True Target
         add_proxy_log(client_ip, actual_target, resolved_ip, "requested")
 
-        # Forward the intercepted packet and enter relay loop
-        remote.sendall(first_packet)
+        # Forward intercepted packet if any
+        if first_packet:
+            remote.sendall(first_packet)
 
+        # High-Speed Relay Loop
         sockets = [client_socket, remote]
         while True:
             r, _, _ = select.select(sockets, [], [])
             for s in r:
-                data = s.recv(4096)
+                data = s.recv(16384)
                 if not data: return
                 if s is client_socket: remote.sendall(data)
                 else: client_socket.sendall(data)
